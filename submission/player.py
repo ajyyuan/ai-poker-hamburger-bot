@@ -16,7 +16,7 @@ TOTAL_MATCH_HANDS = 1000
 AVERAGE_FORCED_LOSS = 1.5  # Forced loss per hand (in chips)
 
 # Define a simple feedforward network as our policy network.
-# This network will output logits over candidate multipliers.
+# This network outputs logits over candidate multipliers.
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(PolicyNetwork, self).__init__()
@@ -36,7 +36,7 @@ class ValueNetwork(nn.Module):
         super(ValueNetwork, self).__init__()
         self.fc1 = nn.Linear(input_dim, 16)
         self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(16, 1)  # Output a single value estimate
+        self.fc2 = nn.Linear(16, 1)  # Single value estimate
         
     def forward(self, x):
         x = self.fc1(x)
@@ -56,21 +56,23 @@ class PlayerAgent(Agent):
         # Net advantage: (our chips - opponent's chips)
         self.total_reward = 0
 
-        # Hand counting: we'll increment on hand termination.
+        # Hand counting: incremented on hand termination.
         self.hand_count = 0
-        self.hand_counted = False  # flag to ensure one count per terminated hand
+        self.hand_counted = False  # ensures one count per terminated hand
 
         # --- RL Module: Actor-Critic for Multiplier Selection ---
-        # Candidate multipliers (e.g., 0.8 => threshold = 0.65*0.8 = 0.52)
+        # Candidate multipliers (e.g., 0.8 => threshold = 0.65 * 0.8 = 0.52)
         self.strategy_candidates = [0.8, 0.85, 0.9, 0.95, 1.0]
         self.num_candidates = len(self.strategy_candidates)
-        # Input features: [equity, pot_odds, opp_aggr, normalized_hand_count, normalized_total_reward]
-        self.input_dim = 5  
+        # Expanded feature vector: now 10 elements.
+        # Features: equity, pot_odds, opp_aggr, normalized_hand_count, normalized_total_reward,
+        #           normalized street, bet difference ratio, normalized pot size, normalized board texture, board connectivity.
+        self.input_dim = 10  
         self.policy_net = PolicyNetwork(self.input_dim, self.num_candidates)
         self.value_net = ValueNetwork(self.input_dim)
         self.actor_optimizer = optim.Adam(self.policy_net.parameters(), lr=0.01)
         self.critic_optimizer = optim.Adam(self.value_net.parameters(), lr=0.01)
-        # We'll store the log probability and state features for the update.
+        # We'll store the log probability and state features for the actor-critic update.
         self.last_log_prob = None
         self.last_state = None
 
@@ -141,19 +143,51 @@ class PlayerAgent(Agent):
 
     def get_features(self, observation, equity, pot_odds, opp_aggr):
         """
-        Construct a feature vector:
-          - equity, pot_odds, opp_aggr,
-          - normalized hand count, normalized total reward.
+        Construct a feature vector with 10 elements:
+          1. equity: win probability (0 to 1)
+          2. pot_odds: ratio of call cost to total pot
+          3. opp_aggr: opponent aggression ratio
+          4. normalized hand count: hand_count / TOTAL_MATCH_HANDS
+          5. normalized total reward: total_reward / 100
+          6. normalized street: observation["street"] / 3
+          7. bet difference ratio: (opp_bet - my_bet) / pot_size (0 if pot_size==0)
+          8. normalized pot size: pot_size / 200
+          9. board texture: unique suits among visible community cards, normalized by 3
+          10. board connectivity: (max(rank) - min(rank)) among community cards, normalized by 8
         """
         norm_hand = self.hand_count / TOTAL_MATCH_HANDS
         norm_reward = self.total_reward / 100.0
-        features = np.array([equity, pot_odds, opp_aggr, norm_hand, norm_reward], dtype=np.float32)
+        street = observation["street"] / 3.0
+
+        my_bet = observation["my_bet"]
+        opp_bet = observation["opp_bet"]
+        pot_size = opp_bet + my_bet
+        bet_diff = (opp_bet - my_bet) / pot_size if pot_size > 0 else 0.0
+        norm_pot = pot_size / 200.0
+
+        community_cards = [card for card in observation["community_cards"] if card != -1]
+        if community_cards:
+            unique_suits = len(set(card // 9 for card in community_cards))
+        else:
+            unique_suits = 0
+        norm_texture = unique_suits / 3.0
+
+        if community_cards:
+            ranks = [card % 9 for card in community_cards]
+            connectivity = (max(ranks) - min(ranks)) / 8.0
+        else:
+            connectivity = 0.0
+
+        features = np.array([
+            equity, pot_odds, opp_aggr, norm_hand, norm_reward,
+            street, bet_diff, norm_pot, norm_texture, connectivity
+        ], dtype=np.float32)
         return features
 
     def select_action_actor(self, features):
         """
         Use the policy network (actor) with softmax to select a raise threshold multiplier.
-        We'll store the log probability and state for later actor-critic update.
+        Stores the log probability and state for the actor-critic update.
         """
         state = torch.tensor(features).unsqueeze(0)  # shape: [1, input_dim]
         logits = self.policy_net(state)  # raw logits
@@ -168,17 +202,14 @@ class PlayerAgent(Agent):
 
     def update_actor_critic(self, reward):
         """
-        Update both the actor (policy network) and the critic (value network) using an actor-critic update.
-        We'll compute the advantage as: reward - value_estimate.
+        Update both the actor (policy network) and critic (value network) using an actor-critic update.
+        Advantage is computed as reward minus the value estimate of the last state.
         """
         if self.last_state is None or self.last_log_prob is None:
             return
-        # Compute the value estimate for the last state.
         value_estimate = self.value_net(self.last_state)
         advantage = reward - value_estimate.item()
-        # Actor loss: negative log probability weighted by advantage.
         actor_loss = -self.last_log_prob * advantage
-        # Critic loss: Mean Squared Error between reward and value estimate.
         critic_loss = nn.MSELoss()(value_estimate, torch.tensor([[reward]], dtype=torch.float32))
         total_loss = actor_loss + critic_loss
         self.actor_optimizer.zero_grad()
@@ -191,7 +222,7 @@ class PlayerAgent(Agent):
         self.last_state = None
 
     def act(self, observation, reward, terminated, truncated, info):
-        # Auto-fold check at the start of a hand (reset_hand() is called at street 0).
+        # Auto-fold check at hand start.
         if observation["street"] == 0:
             self.reset_hand()
             remaining_rounds = TOTAL_MATCH_HANDS - self.hand_count
@@ -201,7 +232,7 @@ class PlayerAgent(Agent):
                 self.logger.info(f"Auto-fold activated: total_reward={self.total_reward:.2f} >= threshold={needed_for_safe_fold:.2f}")
                 return (action_types.FOLD.value, 0, -1)
 
-        # Check auto-flop mode: if total_reward > 1.5 * rounds_left, play conservatively.
+        # Check auto-flop mode.
         rounds_left = TOTAL_MATCH_HANDS - self.hand_count
         if self.total_reward > AVERAGE_FORCED_LOSS * rounds_left:
             self.logger.info(f"Auto-flop mode triggered. hand_count={self.hand_count}, total_reward={self.total_reward}, rounds_left={rounds_left}")
@@ -235,7 +266,7 @@ class PlayerAgent(Agent):
         opp_aggr = self.get_opponent_aggressiveness()
         features = self.get_features(observation, equity, pot_odds, opp_aggr)
         
-        # Use fixed GTO strategy until learning phase starts.
+        # Use fixed GTO strategy until learning_start_hand; then use actor-critic adaptation.
         if self.hand_count < self.learning_start_hand:
             chosen_multiplier = 1.0
             self.logger.debug("Using default GTO strategy (multiplier=1.0)")
@@ -246,7 +277,6 @@ class PlayerAgent(Agent):
         normal_threshold = 0.65
         raise_threshold = normal_threshold * chosen_multiplier
         self.logger.debug(f"Computed raise threshold: {raise_threshold:.2f}")
-        
         self.update_opponent_model(observation)
         self.logger.debug(f"hand_count={self.hand_count}, Equity={equity:.2f}, PotOdds={pot_odds:.2f}, OppAgg={opp_aggr:.2f}")
         valid = observation["valid_actions"]
@@ -282,10 +312,8 @@ class PlayerAgent(Agent):
         # Update total reward.
         self.total_reward += reward
         if terminated and not self.hand_counted:
-            # Count the terminated hand exactly once.
             self.hand_count += 1
             self.hand_counted = True
             self.logger.debug(f"Hand terminated. Updated hand count: {self.hand_count}")
-            # Update the actor-critic network.
             self.update_actor_critic(reward)
             self.logger.info(f"Hand completed with reward={reward}")
