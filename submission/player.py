@@ -16,7 +16,7 @@ TOTAL_MATCH_HANDS = 1000
 AVERAGE_FORCED_LOSS = 1.5  # Forced loss per hand (in chips)
 
 ##############################################
-# Recurrent Networks for Actor and Critic
+# Recurrent Networks for Actor and Critic (Expert)
 ##############################################
 
 class RecurrentPolicyNetwork(nn.Module):
@@ -26,11 +26,8 @@ class RecurrentPolicyNetwork(nn.Module):
         self.fc = nn.Linear(hidden_size, output_dim)
         
     def forward(self, x, hidden):
-        # x shape: [batch, seq_len, input_dim]
-        # hidden: tuple (h0, c0) each of shape [num_layers, batch, hidden_size]
         out, hidden = self.lstm(x, hidden)
-        # Take the last output
-        out = out[:, -1, :]  # shape: [batch, hidden_size]
+        out = out[:, -1, :]  # use last output
         logits = self.fc(out)
         return logits, hidden
 
@@ -41,14 +38,31 @@ class RecurrentValueNetwork(nn.Module):
         self.fc = nn.Linear(hidden_size, 1)
         
     def forward(self, x, hidden):
-        # x shape: [batch, seq_len, input_dim]
         out, hidden = self.lstm(x, hidden)
-        out = out[:, -1, :]  # shape: [batch, hidden_size]
+        out = out[:, -1, :]
         value = self.fc(out)
         return value, hidden
 
 ##############################################
-# Updated Agent with LSTM-based Actor-Critic
+# Meta-Controller Network
+##############################################
+
+class MetaController(nn.Module):
+    def __init__(self, input_dim, num_experts, hidden_size=16):
+        super(MetaController, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_size)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, num_experts)
+        
+    def forward(self, x):
+        # x shape: [batch, input_dim]
+        out = self.fc1(x)
+        out = self.relu(out)
+        logits = self.fc2(out)
+        return logits  # logits over experts
+
+##############################################
+# Updated Agent with Ensemble of Experts and Meta-Controller
 ##############################################
 
 class PlayerAgent(Agent):
@@ -59,47 +73,64 @@ class PlayerAgent(Agent):
         self.opp_action_counts = {"raise": 0, "call": 0, "check": 0, "discard": 0, "fold": 0}
         self.last_opp_bet = 0
         self.has_discarded = False
-        
         self.total_reward = 0
 
-        # Hand counting: updated on hand termination.
+        # Hand counting: update on hand termination.
         self.hand_count = 0
-        self.hand_counted = False  # ensures one count per terminated hand
+        self.hand_counted = False
 
-        # --- RL Module: Recurrent Actor-Critic for Multiplier Selection ---
+        # --- Ensemble of Experts ---
+        self.num_experts = 3
+        # Candidate multipliers remain as before.
         self.strategy_candidates = [0.8, 0.85, 0.9, 0.95, 1.0]
         self.num_candidates = len(self.strategy_candidates)
-        # Expanded feature vector (we keep the 10-element feature vector)
+        # Expanded feature vector: 10 elements.
         self.input_dim = 10  
-        # Recurrent networks: using LSTM
-        self.policy_net = RecurrentPolicyNetwork(self.input_dim, self.num_candidates, hidden_size=16)
-        self.value_net = RecurrentValueNetwork(self.input_dim, hidden_size=16)
-        self.actor_optimizer = optim.Adam(self.policy_net.parameters(), lr=0.01)
-        self.critic_optimizer = optim.Adam(self.value_net.parameters(), lr=0.01)
-        self.last_log_prob = None
+        # Create an ensemble of recurrent actor networks and critics.
+        self.expert_actors = nn.ModuleList([
+            RecurrentPolicyNetwork(self.input_dim, self.num_candidates, hidden_size=16)
+            for _ in range(self.num_experts)
+        ])
+        self.expert_critics = nn.ModuleList([
+            RecurrentValueNetwork(self.input_dim, hidden_size=16)
+            for _ in range(self.num_experts)
+        ])
+        # We'll maintain separate hidden states for each expert.
+        self.expert_hidden = [None] * self.num_experts
+        self.critic_hidden = [None] * self.num_experts
+
+        # Meta-Controller: to select which expert to use.
+        self.meta_controller = MetaController(self.input_dim, self.num_experts, hidden_size=16)
+        self.meta_optimizer = optim.Adam(self.meta_controller.parameters(), lr=0.01)
+
+        # Actor and critic optimizers for experts.
+        self.actor_optimizers = [optim.Adam(expert.parameters(), lr=0.01) for expert in self.expert_actors]
+        self.critic_optimizers = [optim.Adam(critic.parameters(), lr=0.01) for critic in self.expert_critics]
+
+        # For storing last meta log probability and chosen expert index.
+        self.last_meta_log_prob = None
+        self.last_expert_index = None
+        self.last_expert_log_prob = None
         self.last_state = None
-        # Initialize hidden states for actor and critic; we'll reset them at the start of each hand.
-        self.actor_hidden = None
-        self.critic_hidden = None
 
         # --- Mode Switching for Surprise Play ---
         self.mode = "normal"
-        self.mode_duration = 0  # number of hands the override lasts
-        self.aggressive_multiplier = 0.8  # force more aggressive play
-        self.conservative_multiplier = 1.1  # force more conservative play
+        self.mode_duration = 0
+        self.aggressive_multiplier = 0.8
+        self.conservative_multiplier = 1.1
 
         # --- Learning Start Threshold ---
         self.learning_start_hand = random.randint(100, 200)
         self.logger.info(f"RL adaptation will start at hand {self.learning_start_hand}")
 
     def reset_hand(self):
-        """Reset per-hand flags and hidden states; called at the start of each hand."""
+        """Reset per-hand flags and hidden states at the start of each hand."""
         self.last_opp_bet = 0
         self.has_discarded = False
         self.hand_counted = False
-        # Reset hidden states for the recurrent networks for a fresh start
-        self.actor_hidden = None
-        self.critic_hidden = None
+        # Reset hidden states for all experts.
+        self.expert_hidden = [None] * self.num_experts
+        self.critic_hidden = [None] * self.num_experts
 
     def compute_equity(self, observation, num_simulations=200):
         """Monte Carlo simulation to estimate win probability."""
@@ -161,13 +192,13 @@ class PlayerAgent(Agent):
           1. equity (0-1)
           2. pot_odds
           3. opp_aggr
-          4. normalized hand count: hand_count / TOTAL_MATCH_HANDS
-          5. normalized total reward: total_reward / 100
-          6. normalized street: observation["street"] / 3
-          7. bet difference ratio: (opp_bet - my_bet) / pot_size (or 0 if pot_size==0)
-          8. normalized pot size: pot_size / 200
+          4. normalized hand count: hand_count/TOTAL_MATCH_HANDS
+          5. normalized total reward: total_reward/100
+          6. normalized street: observation["street"]/3
+          7. bet difference ratio: (opp_bet - my_bet)/pot_size (or 0)
+          8. normalized pot size: pot_size/200
           9. board texture: unique suits among visible community cards normalized by 3
-          10. board connectivity: (max(rank)-min(rank)) among visible community cards normalized by 8
+          10. board connectivity: (max(rank)-min(rank)) normalized by 8
         """
         norm_hand = self.hand_count / TOTAL_MATCH_HANDS
         norm_reward = self.total_reward / 100.0
@@ -200,66 +231,85 @@ class PlayerAgent(Agent):
 
     def select_action_actor(self, features):
         """
-        Use the recurrent policy network (actor) with softmax to select a raise threshold multiplier.
-        We update the hidden state across calls.
+        Use the meta-controller to select an expert, then use that expert's recurrent actor network
+        to choose a raise threshold multiplier.
         """
-        # Prepare state as sequence length 1: shape [batch=1, seq_len=1, input_dim]
+        # First, get meta-controller probabilities.
+        state_meta = torch.tensor(features).unsqueeze(0)  # shape: [1, input_dim]
+        meta_logits = self.meta_controller(state_meta)
+        meta_probs = torch.softmax(meta_logits, dim=1)
+        meta_dist = torch.distributions.Categorical(meta_probs)
+        expert_index = meta_dist.sample().item()
+        self.last_meta_log_prob = meta_dist.log_prob(torch.tensor(expert_index))
+        self.last_expert_index = expert_index
+
+        # Now, use the chosen expert's actor.
+        # Prepare state for LSTM: shape [1, 1, input_dim]
         state = torch.tensor(features).unsqueeze(0).unsqueeze(0)
-        # Initialize hidden state if needed.
-        if self.actor_hidden is None:
-            # (num_layers, batch, hidden_size)
-            self.actor_hidden = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
-        logits, self.actor_hidden = self.policy_net(state, self.actor_hidden)
+        # If this expert's hidden state is not initialized, do so.
+        if self.expert_hidden[expert_index] is None:
+            self.expert_hidden[expert_index] = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
+        logits, new_hidden = self.expert_actors[expert_index](state, self.expert_hidden[expert_index])
+        self.expert_hidden[expert_index] = new_hidden
         probs = torch.softmax(logits, dim=1)
         dist = torch.distributions.Categorical(probs)
         action = dist.sample()
-        self.last_log_prob = dist.log_prob(action)
-        self.last_state = state  # Store for update (could also store features)
+        self.last_expert_log_prob = dist.log_prob(action)
+        self.last_state = state  # store state for actor-critic update
         chosen_multiplier = self.strategy_candidates[action.item()]
-        self.logger.debug(f"Actor selected multiplier: {chosen_multiplier} (log_prob={self.last_log_prob.item():.4f})")
+        self.logger.debug(f"Expert {expert_index} selected multiplier: {chosen_multiplier} (log_prob={self.last_expert_log_prob.item():.4f})")
         return chosen_multiplier
 
     def update_actor_critic(self, reward):
         """
-        Update both the actor (policy network) and critic (value network) using an actor-critic update.
-        The advantage is computed as: reward - value_estimate.
+        Update the chosen expert's actor and critic networks and the meta-controller using an actor-critic update.
+        Advantage = reward - value_estimate.
         """
-        if self.last_state is None or self.last_log_prob is None:
+        if self.last_state is None or self.last_expert_log_prob is None or self.last_meta_log_prob is None:
             return
-        # For critic: use last_state (shape [1,1,input_dim]) and initialize critic_hidden if needed.
-        if self.critic_hidden is None:
-            self.critic_hidden = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
-        value_estimate, self.critic_hidden = self.value_net(self.last_state, self.critic_hidden)
+        expert_index = self.last_expert_index
+        # Update critic for the chosen expert.
+        if self.critic_hidden[expert_index] is None:
+            self.critic_hidden[expert_index] = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
+        value_estimate, new_hidden = self.expert_critics[expert_index](self.last_state, self.critic_hidden[expert_index])
+        self.critic_hidden[expert_index] = new_hidden
         advantage = reward - value_estimate.item()
-        actor_loss = -self.last_log_prob * advantage
+        # Actor loss for the chosen expert.
+        actor_loss = -self.last_expert_log_prob * advantage
         critic_loss = nn.MSELoss()(value_estimate, torch.tensor([[reward]], dtype=torch.float32))
         total_loss = actor_loss + critic_loss
-        self.actor_optimizer.zero_grad()
-        self.critic_optimizer.zero_grad()
+        self.actor_optimizers[expert_index].zero_grad()
+        self.critic_optimizers[expert_index].zero_grad()
         total_loss.backward()
-        self.actor_optimizer.step()
-        self.critic_optimizer.step()
-        self.logger.debug(f"Actor-Critic update: actor_loss={actor_loss.item():.4f}, critic_loss={critic_loss.item():.4f}")
-        self.last_log_prob = None
+        self.actor_optimizers[expert_index].step()
+        self.critic_optimizers[expert_index].step()
+        # Also update meta-controller using the same advantage.
+        meta_loss = -self.last_meta_log_prob * advantage
+        self.meta_optimizer.zero_grad()
+        meta_loss.backward()
+        self.meta_optimizer.step()
+        self.logger.debug(f"Actor-Critic update for expert {expert_index}: actor_loss={actor_loss.item():.4f}, critic_loss={critic_loss.item():.4f}, meta_loss={meta_loss.item():.4f}")
+        self.last_expert_log_prob = None
+        self.last_meta_log_prob = None
         self.last_state = None
 
     def maybe_switch_mode(self):
         """
-        Occasionally switch between normal, aggressive, and conservative modes for a few hands.
+        Occasionally switch mode (aggressive or conservative) for a brief period.
+        Aggressive forces multiplier=0.8; conservative forces multiplier=1.1.
         """
         if self.mode_duration > 0:
             self.mode_duration -= 1
         else:
-            # With 10% probability, switch to an override mode for 3-10 hands.
-            if random.random() < 0.1:
+            if random.random() < 0.1:  # 10% chance to switch mode
                 self.mode = random.choice(["aggressive", "conservative"])
-                self.mode_duration = random.randint(3, 10)
+                self.mode_duration = random.randint(3, 5)  # override lasts 3-5 hands
                 self.logger.info(f"Mode switch: entering {self.mode} mode for {self.mode_duration} hands")
             else:
                 self.mode = "normal"
 
     def act(self, observation, reward, terminated, truncated, info):
-        # At the start of each hand (street 0), reset and possibly switch mode.
+        # At street 0, reset hand and possibly switch mode.
         if observation["street"] == 0:
             self.reset_hand()
             self.maybe_switch_mode()
@@ -296,7 +346,7 @@ class PlayerAgent(Agent):
                     self.logger.info("Auto-flop (post-flop): Folding.")
                     return (action_types.FOLD.value, 0, -1)
 
-        # Normal behavior: compute state features.
+        # Normal behavior.
         equity = self.compute_equity(observation)
         continue_cost = observation["opp_bet"] - observation["my_bet"]
         pot_size = observation["opp_bet"] + observation["my_bet"]
@@ -309,6 +359,7 @@ class PlayerAgent(Agent):
             chosen_multiplier = 1.0
             self.logger.debug("Using default GTO strategy (multiplier=1.0)")
         else:
+            # If mode override is active, use that.
             if self.mode == "aggressive":
                 chosen_multiplier = self.aggressive_multiplier
                 self.logger.info("Mode override: aggressive")
@@ -317,7 +368,7 @@ class PlayerAgent(Agent):
                 self.logger.info("Mode override: conservative")
             else:
                 chosen_multiplier = self.select_action_actor(features)
-                self.logger.debug(f"Using actor-critic strategy multiplier: {chosen_multiplier}")
+                self.logger.debug(f"Using actor-critic ensemble; chosen multiplier: {chosen_multiplier}")
         
         normal_threshold = 0.65
         raise_threshold = normal_threshold * chosen_multiplier
