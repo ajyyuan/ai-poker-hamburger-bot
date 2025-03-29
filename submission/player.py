@@ -13,7 +13,6 @@ int_to_card = PokerEnv.int_to_card
 TOTAL_MATCH_HANDS = 1000
 AVERAGE_FORCED_LOSS = 1.5  # Forced loss per hand (in chips)
 
-
 ##############################################
 # Recurrent Networks for Actor and Critic (Expert)
 ##############################################
@@ -77,7 +76,7 @@ class PlayerAgent(Agent):
         self.has_discarded = False
         self.total_reward = 0
 
-        # Hand counting: update on hand termination.
+        # Hand counting
         self.hand_count = 0
         self.hand_counted = False
 
@@ -97,11 +96,11 @@ class PlayerAgent(Agent):
         self.expert_hidden = [None] * self.num_experts
         self.critic_hidden = [None] * self.num_experts
 
-        # Meta-Controller: to select which expert to use.
+        # Meta-Controller
         self.meta_controller = MetaController(self.input_dim, self.num_experts, hidden_size=16)
         self.meta_optimizer = optim.Adam(self.meta_controller.parameters(), lr=0.01)
 
-        # Actor and critic optimizers for experts.
+        # Optimizers for experts
         self.actor_optimizers = [optim.Adam(expert.parameters(), lr=0.01) for expert in self.expert_actors]
         self.critic_optimizers = [optim.Adam(critic.parameters(), lr=0.01) for critic in self.expert_critics]
 
@@ -116,11 +115,18 @@ class PlayerAgent(Agent):
         self.aggressive_multiplier = 0.8
         self.conservative_multiplier = 1.1
 
-        # --- PHASE THRESHOLDS ---
-        self.random_phase_end = 50  # <-- CHANGED/ADDED
-        self.gto_phase_end = random.randint(100, 200)  # <-- CHANGED/ADDED
+        # --- PHASE THRESHOLDS ---  # <-- CHANGED/ADDED
+        self.conservative_phase_end = 25
+        self.aggressive_phase_end = 50
+        self.random_phase_end = 75
+        self.gto_phase_end = random.randint(125, 200)
+
         self.logger.info(
-            f"Random phase ends at hand={self.random_phase_end}, GTO phase ends at hand={self.gto_phase_end}"
+            f"Phases: [0-{self.conservative_phase_end - 1}] conservative, "
+            f"[{self.conservative_phase_end}-{self.aggressive_phase_end - 1}] aggressive, "
+            f"[{self.aggressive_phase_end}-{self.random_phase_end - 1}] random, "
+            f"[{self.random_phase_end}-{self.gto_phase_end - 1}] GTO, "
+            f"[≥{self.gto_phase_end}] RL"
         )  # <-- CHANGED/ADDED
 
     def reset_hand(self):
@@ -230,18 +236,18 @@ class PlayerAgent(Agent):
 
     def select_action_actor(self, features):
         """
-        Use the meta-controller to select an expert, then use that expert's recurrent actor network
+        Use meta-controller to select an expert, then use that expert's recurrent actor network
         to choose a raise threshold multiplier.
         """
-        state_meta = torch.tensor(features).unsqueeze(0)  # shape: [1, input_dim]
+        state_meta = torch.tensor(features).unsqueeze(0)
         meta_logits = self.meta_controller(state_meta)
         meta_probs = torch.softmax(meta_logits, dim=1)
         meta_dist = torch.distributions.Categorical(meta_probs)
         expert_index = meta_dist.sample().item()
+
         self.last_meta_log_prob = meta_dist.log_prob(torch.tensor(expert_index))
         self.last_expert_index = expert_index
 
-        # Chosen expert's actor
         state = torch.tensor(features).unsqueeze(0).unsqueeze(0)
         if self.expert_hidden[expert_index] is None:
             self.expert_hidden[expert_index] = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
@@ -254,20 +260,28 @@ class PlayerAgent(Agent):
         self.last_state = state
 
         chosen_multiplier = self.strategy_candidates[action.item()]
-        self.logger.debug(f"Expert {expert_index} selected multiplier: {chosen_multiplier} (log_prob={self.last_expert_log_prob.item():.4f})")
+        self.logger.debug(
+            f"Expert {expert_index} selected multiplier: {chosen_multiplier} "
+            f"(log_prob={self.last_expert_log_prob.item():.4f})"
+        )
         return chosen_multiplier
 
     def update_actor_critic(self, reward):
         """
-        Update the chosen expert's actor and critic networks and the meta-controller using an actor-critic update.
+        Update the chosen expert's actor and critic networks + meta-controller using actor-critic.
         Advantage = reward - value_estimate.
         """
-        if self.last_state is None or self.last_expert_log_prob is None or self.last_meta_log_prob is None:
+        if (self.last_state is None or self.last_expert_log_prob is None
+                or self.last_meta_log_prob is None):
             return
+
         expert_index = self.last_expert_index
         if self.critic_hidden[expert_index] is None:
             self.critic_hidden[expert_index] = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
-        value_estimate, new_hidden = self.expert_critics[expert_index](self.last_state, self.critic_hidden[expert_index])
+
+        value_estimate, new_hidden = self.expert_critics[expert_index](
+            self.last_state, self.critic_hidden[expert_index]
+        )
         self.critic_hidden[expert_index] = new_hidden
         advantage = reward - value_estimate.item()
 
@@ -291,16 +305,21 @@ class PlayerAgent(Agent):
             f"critic_loss={critic_loss.item():.4f}, "
             f"meta_loss={meta_loss.item():.4f}"
         )
+
         self.last_expert_log_prob = None
         self.last_meta_log_prob = None
         self.last_state = None
 
     def maybe_switch_mode(self):
-        """Occasionally switch mode (aggressive or conservative) for a brief period."""
+        """
+        Occasionally switch mode (aggressive or conservative) for a brief period.
+        This is separate from our forced phases and only applies in normal RL phase,
+        but we leave it in for additional variability if desired.
+        """
         if self.mode_duration > 0:
             self.mode_duration -= 1
         else:
-            if random.random() < 0.1:  # 10% chance to switch mode
+            if random.random() < 0.1:
                 self.mode = random.choice(["aggressive", "conservative"])
                 self.mode_duration = random.randint(3, 5)
                 self.logger.info(f"Mode switch: entering {self.mode} mode for {self.mode_duration} hands")
@@ -308,22 +327,29 @@ class PlayerAgent(Agent):
                 self.mode = "normal"
 
     def act(self, observation, reward, terminated, truncated, info):
-        # At street 0, reset hand and possibly switch mode.
+        # At street 0, reset hand and maybe switch mode.
         if observation["street"] == 0:
             self.reset_hand()
             self.maybe_switch_mode()
             remaining_rounds = TOTAL_MATCH_HANDS - self.hand_count
             needed_for_safe_fold = remaining_rounds * AVERAGE_FORCED_LOSS
-            self.logger.debug(f"Pre-hand: hand_count={self.hand_count}, total_reward={self.total_reward:.2f}, threshold={needed_for_safe_fold:.2f}")
+            self.logger.debug(
+                f"Pre-hand: hand_count={self.hand_count}, "
+                f"total_reward={self.total_reward:.2f}, threshold={needed_for_safe_fold:.2f}"
+            )
             if self.total_reward > 0 and self.total_reward >= needed_for_safe_fold:
-                self.logger.info(f"Auto-fold activated: total_reward={self.total_reward:.2f} >= threshold={needed_for_safe_fold:.2f}")
+                self.logger.info(
+                    f"Auto-fold activated: total_reward={self.total_reward:.2f} "
+                    f">= threshold={needed_for_safe_fold:.2f}"
+                )
                 return (action_types.FOLD.value, 0, -1)
 
         # Check auto-flop mode.
         rounds_left = TOTAL_MATCH_HANDS - self.hand_count
         if self.total_reward > AVERAGE_FORCED_LOSS * rounds_left:
             self.logger.info(
-                f"Auto-flop mode triggered. hand_count={self.hand_count}, total_reward={self.total_reward}, rounds_left={rounds_left}"
+                f"Auto-flop mode triggered. hand_count={self.hand_count}, "
+                f"total_reward={self.total_reward}, rounds_left={rounds_left}"
             )
             valid = observation["valid_actions"]
             if observation["street"] == 0:
@@ -347,7 +373,7 @@ class PlayerAgent(Agent):
                     self.logger.info("Auto-flop (post-flop): Folding.")
                     return (action_types.FOLD.value, 0, -1)
 
-        # Compute a few helpful quantities.
+        # Compute equity, pot odds, etc.
         equity = self.compute_equity(observation)
         continue_cost = observation["opp_bet"] - observation["my_bet"]
         pot_size = observation["opp_bet"] + observation["my_bet"]
@@ -355,52 +381,59 @@ class PlayerAgent(Agent):
         opp_aggr = self.get_opponent_aggressiveness()
         features = self.get_features(observation, equity, pot_odds, opp_aggr)
 
-        # --- PHASE LOGIC: Random -> GTO -> RL ---
-        if self.hand_count < self.random_phase_end:  # <-- CHANGED/ADDED
-            # --- RANDOM phase ---
+        # --- FORCED PHASE LOGIC ---  # <-- CHANGED/ADDED
+        # 1) 0..24 => Conservative
+        if self.hand_count < self.conservative_phase_end:
+            chosen_multiplier = 1.1
+            self.logger.debug("Conservative phase (multiplier=1.1)")
+        # 2) 25..49 => Aggressive
+        elif self.hand_count < self.aggressive_phase_end:
+            chosen_multiplier = 0.8
+            self.logger.debug("Aggressive phase (multiplier=0.8)")
+        # 3) 50..74 => Random
+        elif self.hand_count < self.random_phase_end:
+            self.logger.debug("Random phase")
+            # Just pick a random valid action
             valid_actions = []
             for act_type, is_valid in observation["valid_actions"].items():
                 if is_valid:
                     valid_actions.append(act_type)
 
             if not valid_actions:
-                # default to fold if no valid actions
                 action_type = action_types.FOLD.value
-                raise_amount = 0
-                card_to_discard = -1
+                return (action_type, 0, -1)
             else:
-                # random choice among valid
                 action_type = random.choice(valid_actions)
                 raise_amount = 0
                 card_to_discard = -1
                 if action_type == action_types.RAISE.value:
                     base_raise = max(observation["min_raise"], 1)
-                    raise_range = range(base_raise, min(base_raise + 5, observation["max_raise"] + 1))
+                    max_r = max(observation["max_raise"], base_raise)
+                    raise_range = range(base_raise, max_r + 1)
                     if raise_range:
                         raise_amount = random.choice(list(raise_range))
                 elif action_type == action_types.DISCARD.value:
+                    # e.g. discard the lower card
                     card_to_discard = 0 if observation["my_cards"][0] < observation["my_cards"][1] else 1
                     self.has_discarded = True
-
-            return (action_type, raise_amount, card_to_discard)
-
-        elif self.hand_count < self.gto_phase_end:  # <-- CHANGED/ADDED
-            # --- GTO phase ---
+                return (action_type, raise_amount, card_to_discard)
+        # 4) 75..N => GTO
+        elif self.hand_count < self.gto_phase_end:
             chosen_multiplier = 1.0
-            self.logger.debug("Using default GTO strategy (multiplier=1.0)")
+            self.logger.debug("GTO phase (multiplier=1.0)")
+        # 5) >= N => RL-based
         else:
-            # --- RL phase ---
             if self.mode == "aggressive":
                 chosen_multiplier = self.aggressive_multiplier
-                self.logger.info("Mode override: aggressive")
+                self.logger.info("RL phase, mode override: aggressive")
             elif self.mode == "conservative":
                 chosen_multiplier = self.conservative_multiplier
-                self.logger.info("Mode override: conservative")
+                self.logger.info("RL phase, mode override: conservative")
             else:
                 chosen_multiplier = self.select_action_actor(features)
-                self.logger.debug(f"Using actor-critic ensemble; chosen multiplier: {chosen_multiplier}")
+                self.logger.debug(f"RL phase, actor-critic ensemble; chosen multiplier: {chosen_multiplier}")
 
-        # The rest of the logic is the same for GTO or RL phases.
+        # The betting logic for GTO or RL approach (same as your original code):
         normal_threshold = 0.65
         raise_threshold = normal_threshold * chosen_multiplier
         self.logger.debug(f"Computed raise threshold: {raise_threshold:.2f}")
@@ -409,6 +442,7 @@ class PlayerAgent(Agent):
             f"hand_count={self.hand_count}, Equity={equity:.2f}, "
             f"PotOdds={pot_odds:.2f}, OppAgg={opp_aggr:.2f}"
         )
+
         valid = observation["valid_actions"]
         action_type = None
         raise_amount = 0
@@ -422,7 +456,8 @@ class PlayerAgent(Agent):
             calc_raise = base_raise + random_adjustment
             raise_amount = max(observation["min_raise"], min(calc_raise, observation["max_raise"]))
             self.logger.info(
-                f"Raising {raise_amount} with equity={equity:.2f} and threshold={raise_threshold:.2f}"
+                f"Raising {raise_amount} with equity={equity:.2f} "
+                f"and threshold={raise_threshold:.2f}"
             )
         elif valid[action_types.CALL.value] and equity >= pot_odds:
             action_type = action_types.CALL.value
@@ -444,7 +479,6 @@ class PlayerAgent(Agent):
         return (action_type, raise_amount, card_to_discard)
 
     def observe(self, observation, reward, terminated, truncated, info):
-        # Update total reward.
         self.total_reward += reward
 
         if terminated and not self.hand_counted:
