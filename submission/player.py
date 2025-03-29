@@ -116,10 +116,12 @@ class PlayerAgent(Agent):
         self.conservative_multiplier = 1.1
 
         # --- PHASE THRESHOLDS ---  # <-- CHANGED/ADDED
-        self.conservative_phase_end = 25
-        self.aggressive_phase_end = 50
-        self.random_phase_end = 75
-        self.gto_phase_end = random.randint(125, 200)
+        # Use shorter intervals and milder multipliers:
+        self.conservative_phase_end = 10  # ~10 hands
+        self.aggressive_phase_end = 20    # next ~10 hands
+        self.random_phase_end = 30        # next ~10 hands
+        self.gto_phase_end = random.randint(70, 100)  # GTO until this hand
+        # RL afterwards.
 
         self.logger.info(
             f"Phases: [0-{self.conservative_phase_end - 1}] conservative, "
@@ -299,6 +301,10 @@ class PlayerAgent(Agent):
         meta_loss.backward()
         self.meta_optimizer.step()
 
+        self.last_expert_log_prob = None
+        self.last_meta_log_prob = None
+        self.last_state = None
+
         self.logger.debug(
             f"Actor-Critic update for expert {expert_index}: "
             f"actor_loss={actor_loss.item():.4f}, "
@@ -306,22 +312,18 @@ class PlayerAgent(Agent):
             f"meta_loss={meta_loss.item():.4f}"
         )
 
-        self.last_expert_log_prob = None
-        self.last_meta_log_prob = None
-        self.last_state = None
-
     def maybe_switch_mode(self):
         """
-        Occasionally switch mode (aggressive or conservative) for a brief period.
-        This is separate from our forced phases and only applies in normal RL phase,
-        but we leave it in for additional variability if desired.
+        Occasionally switch mode (aggressive or conservative) for a brief period,
+        separate from our forced phases. This likely won't last long
+        or be extreme if you want minimal disruption.
         """
         if self.mode_duration > 0:
             self.mode_duration -= 1
         else:
             if random.random() < 0.1:
                 self.mode = random.choice(["aggressive", "conservative"])
-                self.mode_duration = random.randint(3, 5)
+                self.mode_duration = random.randint(2, 3)  # <-- CHANGED/ADDED: shorter
                 self.logger.info(f"Mode switch: entering {self.mode} mode for {self.mode_duration} hands")
             else:
                 self.mode = "normal"
@@ -382,18 +384,19 @@ class PlayerAgent(Agent):
         features = self.get_features(observation, equity, pot_odds, opp_aggr)
 
         # --- FORCED PHASE LOGIC ---  # <-- CHANGED/ADDED
-        # 1) 0..24 => Conservative
+        # 1) Hands [0..9] => "Conservative"
         if self.hand_count < self.conservative_phase_end:
-            chosen_multiplier = 1.1
-            self.logger.debug("Conservative phase (multiplier=1.1)")
-        # 2) 25..49 => Aggressive
+            chosen_multiplier = 1.05  # more mild than 1.1
+            self.logger.debug("Conservative phase (multiplier=1.05)")
+
+        # 2) Hands [10..19] => "Aggressive"
         elif self.hand_count < self.aggressive_phase_end:
-            chosen_multiplier = 0.8
-            self.logger.debug("Aggressive phase (multiplier=0.8)")
-        # 3) 50..74 => Random
+            chosen_multiplier = 0.95  # more mild than 0.8
+            self.logger.debug("Aggressive phase (multiplier=0.95)")
+
+        # 3) Hands [20..29] => "Random"
         elif self.hand_count < self.random_phase_end:
             self.logger.debug("Random phase")
-            # Just pick a random valid action
             valid_actions = []
             for act_type, is_valid in observation["valid_actions"].items():
                 if is_valid:
@@ -413,15 +416,16 @@ class PlayerAgent(Agent):
                     if raise_range:
                         raise_amount = random.choice(list(raise_range))
                 elif action_type == action_types.DISCARD.value:
-                    # e.g. discard the lower card
                     card_to_discard = 0 if observation["my_cards"][0] < observation["my_cards"][1] else 1
                     self.has_discarded = True
                 return (action_type, raise_amount, card_to_discard)
-        # 4) 75..N => GTO
+
+        # 4) Hands [30..N] => GTO, until random threshold 70–100
         elif self.hand_count < self.gto_phase_end:
             chosen_multiplier = 1.0
             self.logger.debug("GTO phase (multiplier=1.0)")
-        # 5) >= N => RL-based
+
+        # 5) Hands >= N => RL-based
         else:
             if self.mode == "aggressive":
                 chosen_multiplier = self.aggressive_multiplier
