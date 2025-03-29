@@ -16,7 +16,7 @@ TOTAL_MATCH_HANDS = 1000
 AVERAGE_FORCED_LOSS = 1.5  # Forced loss per hand (in chips)
 
 # Define a simple feedforward network as our policy network.
-# This network outputs logits over candidate multipliers.
+# This network will output logits over candidate multipliers.
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(PolicyNetwork, self).__init__()
@@ -58,23 +58,30 @@ class PlayerAgent(Agent):
 
         # Hand counting: incremented on hand termination.
         self.hand_count = 0
-        self.hand_counted = False  # ensures one count per terminated hand
+        self.hand_counted = False  # flag to ensure one count per terminated hand
 
         # --- RL Module: Actor-Critic for Multiplier Selection ---
-        # Candidate multipliers (e.g., 0.8 => threshold = 0.65 * 0.8 = 0.52)
+        # Candidate multipliers for RL mode (for actor-critic adaptation).
         self.strategy_candidates = [0.8, 0.85, 0.9, 0.95, 1.0]
         self.num_candidates = len(self.strategy_candidates)
-        # Expanded feature vector: now 10 elements.
-        # Features: equity, pot_odds, opp_aggr, normalized_hand_count, normalized_total_reward,
-        #           normalized street, bet difference ratio, normalized pot size, normalized board texture, board connectivity.
+        # We'll use an expanded feature vector now (10 elements).
+        # Features: [equity, pot_odds, opp_aggr, normalized_hand_count, normalized_total_reward,
+        #            normalized street, bet diff ratio, normalized pot size, normalized board texture, board connectivity]
         self.input_dim = 10  
         self.policy_net = PolicyNetwork(self.input_dim, self.num_candidates)
         self.value_net = ValueNetwork(self.input_dim)
         self.actor_optimizer = optim.Adam(self.policy_net.parameters(), lr=0.01)
         self.critic_optimizer = optim.Adam(self.value_net.parameters(), lr=0.01)
-        # We'll store the log probability and state features for the actor-critic update.
         self.last_log_prob = None
         self.last_state = None
+
+        # --- Mode Switching for Surprise Play ---
+        # Modes: "normal", "aggressive", "conservative"
+        self.mode = "normal"
+        self.mode_duration = 0  # number of hands the override lasts
+        # Override multipliers: aggressive forces 0.8 (lowest) and conservative forces 1.1.
+        self.aggressive_multiplier = 0.8
+        self.conservative_multiplier = 1.1
 
         # --- Learning Start Threshold ---
         # Until this hand count is reached, play near GTO (fixed multiplier = 1.0).
@@ -97,7 +104,7 @@ class PlayerAgent(Agent):
         if observation["opp_drawn_card"] != -1:
             opp_known.append(observation["opp_drawn_card"])
         shown_cards = set(my_cards + community_cards + opp_known)
-        deck = list(range(27))  # 27-card deck.
+        deck = list(range(27))
         non_shown_cards = [card for card in deck if card not in shown_cards]
         wins = 0
         for _ in range(num_simulations):
@@ -143,17 +150,17 @@ class PlayerAgent(Agent):
 
     def get_features(self, observation, equity, pot_odds, opp_aggr):
         """
-        Construct a feature vector with 10 elements:
-          1. equity: win probability (0 to 1)
-          2. pot_odds: ratio of call cost to total pot
-          3. opp_aggr: opponent aggression ratio
-          4. normalized hand count: hand_count / TOTAL_MATCH_HANDS
-          5. normalized total reward: total_reward / 100
-          6. normalized street: observation["street"] / 3
-          7. bet difference ratio: (opp_bet - my_bet) / pot_size (0 if pot_size==0)
-          8. normalized pot size: pot_size / 200
-          9. board texture: unique suits among visible community cards, normalized by 3
-          10. board connectivity: (max(rank) - min(rank)) among community cards, normalized by 8
+        Construct a 10-element feature vector:
+          1. equity (0-1)
+          2. pot_odds (ratio)
+          3. opp_aggr (ratio)
+          4. normalized hand count: hand_count/TOTAL_MATCH_HANDS
+          5. normalized total reward: total_reward/100
+          6. normalized street: observation["street"]/3
+          7. bet difference ratio: (opp_bet - my_bet)/pot_size (or 0 if pot_size==0)
+          8. normalized pot size: pot_size/200
+          9. board texture: unique suits among visible community cards normalized by 3
+          10. board connectivity: (max(rank)-min(rank)) among visible community cards normalized by 8
         """
         norm_hand = self.hand_count / TOTAL_MATCH_HANDS
         norm_reward = self.total_reward / 100.0
@@ -161,7 +168,7 @@ class PlayerAgent(Agent):
 
         my_bet = observation["my_bet"]
         opp_bet = observation["opp_bet"]
-        pot_size = opp_bet + my_bet
+        pot_size = my_bet + opp_bet
         bet_diff = (opp_bet - my_bet) / pot_size if pot_size > 0 else 0.0
         norm_pot = pot_size / 200.0
 
@@ -187,10 +194,10 @@ class PlayerAgent(Agent):
     def select_action_actor(self, features):
         """
         Use the policy network (actor) with softmax to select a raise threshold multiplier.
-        Stores the log probability and state for the actor-critic update.
+        Stores the log probability and state for later update.
         """
-        state = torch.tensor(features).unsqueeze(0)  # shape: [1, input_dim]
-        logits = self.policy_net(state)  # raw logits
+        state = torch.tensor(features).unsqueeze(0)
+        logits = self.policy_net(state)
         probs = torch.softmax(logits, dim=1)
         dist = torch.distributions.Categorical(probs)
         action = dist.sample()
@@ -202,8 +209,8 @@ class PlayerAgent(Agent):
 
     def update_actor_critic(self, reward):
         """
-        Update both the actor (policy network) and critic (value network) using an actor-critic update.
-        Advantage is computed as reward minus the value estimate of the last state.
+        Update both the actor and critic using an actor-critic update.
+        Advantage = reward - value_estimate.
         """
         if self.last_state is None or self.last_log_prob is None:
             return
@@ -221,10 +228,28 @@ class PlayerAgent(Agent):
         self.last_log_prob = None
         self.last_state = None
 
+    def maybe_switch_mode(self):
+        """
+        With a small probability, switch mode for a spurts of hands.
+        If mode_duration is active, decrement it.
+        If not, with probability p, randomly switch to 'aggressive' or 'conservative' for a random duration.
+        """
+        if self.mode_duration > 0:
+            self.mode_duration -= 1
+        else:
+            # With a small probability, switch mode.
+            if random.random() < 0.1:  # 10% chance per hand to switch mode
+                self.mode = random.choice(["aggressive", "conservative"])
+                self.mode_duration = random.randint(3, 10)  # mode lasts between 3 and 10 hands
+                self.logger.info(f"Mode switch: entering {self.mode} mode for {self.mode_duration} hands")
+            else:
+                self.mode = "normal"
+
     def act(self, observation, reward, terminated, truncated, info):
-        # Auto-fold check at hand start.
+        # Possibly switch mode at the beginning of each hand.
         if observation["street"] == 0:
             self.reset_hand()
+            self.maybe_switch_mode()
             remaining_rounds = TOTAL_MATCH_HANDS - self.hand_count
             needed_for_safe_fold = remaining_rounds * AVERAGE_FORCED_LOSS
             self.logger.debug(f"Pre-hand: hand_count={self.hand_count}, total_reward={self.total_reward:.2f}, threshold={needed_for_safe_fold:.2f}")
@@ -258,22 +283,33 @@ class PlayerAgent(Agent):
                     self.logger.info("Auto-flop (post-flop): Folding.")
                     return (action_types.FOLD.value, 0, -1)
 
-        # Normal behavior: compute state features.
+        # Normal behavior.
         equity = self.compute_equity(observation)
         continue_cost = observation["opp_bet"] - observation["my_bet"]
         pot_size = observation["opp_bet"] + observation["my_bet"]
         pot_odds = continue_cost / (pot_size + continue_cost) if continue_cost > 0 else 0.0
         opp_aggr = self.get_opponent_aggressiveness()
         features = self.get_features(observation, equity, pot_odds, opp_aggr)
-        
-        # Use fixed GTO strategy until learning_start_hand; then use actor-critic adaptation.
+
+        # Determine which mode to use.
+        # Before learning_start_hand, use fixed GTO (multiplier=1.0).
+        # After that, normally use actor-critic adaptation.
+        # However, if mode override is active, use that.
         if self.hand_count < self.learning_start_hand:
             chosen_multiplier = 1.0
             self.logger.debug("Using default GTO strategy (multiplier=1.0)")
         else:
-            chosen_multiplier = self.select_action_actor(features)
-            self.logger.debug(f"Using actor-critic strategy multiplier: {chosen_multiplier}")
-        
+            # Check mode override:
+            if self.mode == "aggressive":
+                chosen_multiplier = self.aggressive_multiplier
+                self.logger.info("Overriding mode: aggressive")
+            elif self.mode == "conservative":
+                chosen_multiplier = self.conservative_multiplier
+                self.logger.info("Overriding mode: conservative")
+            else:
+                chosen_multiplier = self.select_action_actor(features)
+                self.logger.debug(f"Using actor-critic strategy multiplier: {chosen_multiplier}")
+
         normal_threshold = 0.65
         raise_threshold = normal_threshold * chosen_multiplier
         self.logger.debug(f"Computed raise threshold: {raise_threshold:.2f}")
@@ -283,7 +319,6 @@ class PlayerAgent(Agent):
         action_type = None
         raise_amount = 0
         card_to_discard = -1
-        
         if valid[action_types.RAISE.value] and equity > raise_threshold:
             action_type = action_types.RAISE.value
             factor = 0.75 if opp_aggr < 0.5 else 0.5
