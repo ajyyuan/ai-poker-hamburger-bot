@@ -15,84 +15,91 @@ int_to_card = PokerEnv.int_to_card
 TOTAL_MATCH_HANDS = 1000
 AVERAGE_FORCED_LOSS = 1.5  # Forced loss per hand (in chips)
 
-# Define a simple feedforward network as our policy network.
-# This network will output logits over candidate multipliers.
-class PolicyNetwork(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(PolicyNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 16)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(16, output_dim)
-        
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x  # logits
+##############################################
+# Recurrent Networks for Actor and Critic
+##############################################
 
-# Define a value network for the critic.
-class ValueNetwork(nn.Module):
-    def __init__(self, input_dim):
-        super(ValueNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 16)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(16, 1)  # Single value estimate
+class RecurrentPolicyNetwork(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_size=16):
+        super(RecurrentPolicyNetwork, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_dim)
         
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        value = self.fc2(x)
-        return value
+    def forward(self, x, hidden):
+        # x shape: [batch, seq_len, input_dim]
+        # hidden: tuple (h0, c0) each of shape [num_layers, batch, hidden_size]
+        out, hidden = self.lstm(x, hidden)
+        # Take the last output
+        out = out[:, -1, :]  # shape: [batch, hidden_size]
+        logits = self.fc(out)
+        return logits, hidden
+
+class RecurrentValueNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_size=16):
+        super(RecurrentValueNetwork, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 1)
+        
+    def forward(self, x, hidden):
+        # x shape: [batch, seq_len, input_dim]
+        out, hidden = self.lstm(x, hidden)
+        out = out[:, -1, :]  # shape: [batch, hidden_size]
+        value = self.fc(out)
+        return value, hidden
+
+##############################################
+# Updated Agent with LSTM-based Actor-Critic
+##############################################
 
 class PlayerAgent(Agent):
     def __init__(self, stream: bool = False):
         super().__init__(stream)
         self.evaluator = Evaluator()
-        # Track opponent's actions.
+        # Opponent modeling
         self.opp_action_counts = {"raise": 0, "call": 0, "check": 0, "discard": 0, "fold": 0}
         self.last_opp_bet = 0
         self.has_discarded = False
-
-        # Net advantage: (our chips - opponent's chips)
+        
         self.total_reward = 0
 
-        # Hand counting: incremented on hand termination.
+        # Hand counting: updated on hand termination.
         self.hand_count = 0
-        self.hand_counted = False  # flag to ensure one count per terminated hand
+        self.hand_counted = False  # ensures one count per terminated hand
 
-        # --- RL Module: Actor-Critic for Multiplier Selection ---
-        # Candidate multipliers for RL mode (for actor-critic adaptation).
+        # --- RL Module: Recurrent Actor-Critic for Multiplier Selection ---
         self.strategy_candidates = [0.8, 0.85, 0.9, 0.95, 1.0]
         self.num_candidates = len(self.strategy_candidates)
-        # We'll use an expanded feature vector now (10 elements).
-        # Features: [equity, pot_odds, opp_aggr, normalized_hand_count, normalized_total_reward,
-        #            normalized street, bet diff ratio, normalized pot size, normalized board texture, board connectivity]
+        # Expanded feature vector (we keep the 10-element feature vector)
         self.input_dim = 10  
-        self.policy_net = PolicyNetwork(self.input_dim, self.num_candidates)
-        self.value_net = ValueNetwork(self.input_dim)
+        # Recurrent networks: using LSTM
+        self.policy_net = RecurrentPolicyNetwork(self.input_dim, self.num_candidates, hidden_size=16)
+        self.value_net = RecurrentValueNetwork(self.input_dim, hidden_size=16)
         self.actor_optimizer = optim.Adam(self.policy_net.parameters(), lr=0.01)
         self.critic_optimizer = optim.Adam(self.value_net.parameters(), lr=0.01)
         self.last_log_prob = None
         self.last_state = None
+        # Initialize hidden states for actor and critic; we'll reset them at the start of each hand.
+        self.actor_hidden = None
+        self.critic_hidden = None
 
         # --- Mode Switching for Surprise Play ---
-        # Modes: "normal", "aggressive", "conservative"
         self.mode = "normal"
         self.mode_duration = 0  # number of hands the override lasts
-        # Override multipliers: aggressive forces 0.8 (lowest) and conservative forces 1.1.
-        self.aggressive_multiplier = 0.8
-        self.conservative_multiplier = 1.1
+        self.aggressive_multiplier = 0.8  # force more aggressive play
+        self.conservative_multiplier = 1.1  # force more conservative play
 
         # --- Learning Start Threshold ---
-        # Until this hand count is reached, play near GTO (fixed multiplier = 1.0).
         self.learning_start_hand = random.randint(100, 200)
         self.logger.info(f"RL adaptation will start at hand {self.learning_start_hand}")
 
     def reset_hand(self):
-        """Reset per-hand flags; called at the start of each hand."""
+        """Reset per-hand flags and hidden states; called at the start of each hand."""
         self.last_opp_bet = 0
         self.has_discarded = False
         self.hand_counted = False
+        # Reset hidden states for the recurrent networks for a fresh start
+        self.actor_hidden = None
+        self.critic_hidden = None
 
     def compute_equity(self, observation, num_simulations=200):
         """Monte Carlo simulation to estimate win probability."""
@@ -152,13 +159,13 @@ class PlayerAgent(Agent):
         """
         Construct a 10-element feature vector:
           1. equity (0-1)
-          2. pot_odds (ratio)
-          3. opp_aggr (ratio)
-          4. normalized hand count: hand_count/TOTAL_MATCH_HANDS
-          5. normalized total reward: total_reward/100
-          6. normalized street: observation["street"]/3
-          7. bet difference ratio: (opp_bet - my_bet)/pot_size (or 0 if pot_size==0)
-          8. normalized pot size: pot_size/200
+          2. pot_odds
+          3. opp_aggr
+          4. normalized hand count: hand_count / TOTAL_MATCH_HANDS
+          5. normalized total reward: total_reward / 100
+          6. normalized street: observation["street"] / 3
+          7. bet difference ratio: (opp_bet - my_bet) / pot_size (or 0 if pot_size==0)
+          8. normalized pot size: pot_size / 200
           9. board texture: unique suits among visible community cards normalized by 3
           10. board connectivity: (max(rank)-min(rank)) among visible community cards normalized by 8
         """
@@ -193,28 +200,36 @@ class PlayerAgent(Agent):
 
     def select_action_actor(self, features):
         """
-        Use the policy network (actor) with softmax to select a raise threshold multiplier.
-        Stores the log probability and state for later update.
+        Use the recurrent policy network (actor) with softmax to select a raise threshold multiplier.
+        We update the hidden state across calls.
         """
-        state = torch.tensor(features).unsqueeze(0)
-        logits = self.policy_net(state)
+        # Prepare state as sequence length 1: shape [batch=1, seq_len=1, input_dim]
+        state = torch.tensor(features).unsqueeze(0).unsqueeze(0)
+        # Initialize hidden state if needed.
+        if self.actor_hidden is None:
+            # (num_layers, batch, hidden_size)
+            self.actor_hidden = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
+        logits, self.actor_hidden = self.policy_net(state, self.actor_hidden)
         probs = torch.softmax(logits, dim=1)
         dist = torch.distributions.Categorical(probs)
         action = dist.sample()
         self.last_log_prob = dist.log_prob(action)
-        self.last_state = state
+        self.last_state = state  # Store for update (could also store features)
         chosen_multiplier = self.strategy_candidates[action.item()]
         self.logger.debug(f"Actor selected multiplier: {chosen_multiplier} (log_prob={self.last_log_prob.item():.4f})")
         return chosen_multiplier
 
     def update_actor_critic(self, reward):
         """
-        Update both the actor and critic using an actor-critic update.
-        Advantage = reward - value_estimate.
+        Update both the actor (policy network) and critic (value network) using an actor-critic update.
+        The advantage is computed as: reward - value_estimate.
         """
         if self.last_state is None or self.last_log_prob is None:
             return
-        value_estimate = self.value_net(self.last_state)
+        # For critic: use last_state (shape [1,1,input_dim]) and initialize critic_hidden if needed.
+        if self.critic_hidden is None:
+            self.critic_hidden = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
+        value_estimate, self.critic_hidden = self.value_net(self.last_state, self.critic_hidden)
         advantage = reward - value_estimate.item()
         actor_loss = -self.last_log_prob * advantage
         critic_loss = nn.MSELoss()(value_estimate, torch.tensor([[reward]], dtype=torch.float32))
@@ -230,23 +245,21 @@ class PlayerAgent(Agent):
 
     def maybe_switch_mode(self):
         """
-        With a small probability, switch mode for a spurts of hands.
-        If mode_duration is active, decrement it.
-        If not, with probability p, randomly switch to 'aggressive' or 'conservative' for a random duration.
+        Occasionally switch between normal, aggressive, and conservative modes for a few hands.
         """
         if self.mode_duration > 0:
             self.mode_duration -= 1
         else:
-            # With a small probability, switch mode.
-            if random.random() < 0.1:  # 10% chance per hand to switch mode
+            # With 10% probability, switch to an override mode for 3-10 hands.
+            if random.random() < 0.1:
                 self.mode = random.choice(["aggressive", "conservative"])
-                self.mode_duration = random.randint(3, 10)  # mode lasts between 3 and 10 hands
+                self.mode_duration = random.randint(3, 10)
                 self.logger.info(f"Mode switch: entering {self.mode} mode for {self.mode_duration} hands")
             else:
                 self.mode = "normal"
 
     def act(self, observation, reward, terminated, truncated, info):
-        # Possibly switch mode at the beginning of each hand.
+        # At the start of each hand (street 0), reset and possibly switch mode.
         if observation["street"] == 0:
             self.reset_hand()
             self.maybe_switch_mode()
@@ -283,33 +296,29 @@ class PlayerAgent(Agent):
                     self.logger.info("Auto-flop (post-flop): Folding.")
                     return (action_types.FOLD.value, 0, -1)
 
-        # Normal behavior.
+        # Normal behavior: compute state features.
         equity = self.compute_equity(observation)
         continue_cost = observation["opp_bet"] - observation["my_bet"]
         pot_size = observation["opp_bet"] + observation["my_bet"]
         pot_odds = continue_cost / (pot_size + continue_cost) if continue_cost > 0 else 0.0
         opp_aggr = self.get_opponent_aggressiveness()
         features = self.get_features(observation, equity, pot_odds, opp_aggr)
-
-        # Determine which mode to use.
-        # Before learning_start_hand, use fixed GTO (multiplier=1.0).
-        # After that, normally use actor-critic adaptation.
-        # However, if mode override is active, use that.
+        
+        # Use fixed GTO strategy until learning_start_hand.
         if self.hand_count < self.learning_start_hand:
             chosen_multiplier = 1.0
             self.logger.debug("Using default GTO strategy (multiplier=1.0)")
         else:
-            # Check mode override:
             if self.mode == "aggressive":
                 chosen_multiplier = self.aggressive_multiplier
-                self.logger.info("Overriding mode: aggressive")
+                self.logger.info("Mode override: aggressive")
             elif self.mode == "conservative":
                 chosen_multiplier = self.conservative_multiplier
-                self.logger.info("Overriding mode: conservative")
+                self.logger.info("Mode override: conservative")
             else:
                 chosen_multiplier = self.select_action_actor(features)
                 self.logger.debug(f"Using actor-critic strategy multiplier: {chosen_multiplier}")
-
+        
         normal_threshold = 0.65
         raise_threshold = normal_threshold * chosen_multiplier
         self.logger.debug(f"Computed raise threshold: {raise_threshold:.2f}")
@@ -319,6 +328,7 @@ class PlayerAgent(Agent):
         action_type = None
         raise_amount = 0
         card_to_discard = -1
+        
         if valid[action_types.RAISE.value] and equity > raise_threshold:
             action_type = action_types.RAISE.value
             factor = 0.75 if opp_aggr < 0.5 else 0.5
