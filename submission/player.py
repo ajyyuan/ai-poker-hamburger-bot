@@ -30,6 +30,20 @@ class PolicyNetwork(nn.Module):
         x = self.fc2(x)
         return x  # logits
 
+# Define a value network for the critic.
+class ValueNetwork(nn.Module):
+    def __init__(self, input_dim):
+        super(ValueNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 16)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(16, 1)  # Output a single value estimate
+        
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        value = self.fc2(x)
+        return value
+
 class PlayerAgent(Agent):
     def __init__(self, stream: bool = False):
         super().__init__(stream)
@@ -46,16 +60,19 @@ class PlayerAgent(Agent):
         self.hand_count = 0
         self.hand_counted = False  # flag to ensure one count per terminated hand
 
-        # --- RL Module: Policy Gradient for Multiplier Selection ---
+        # --- RL Module: Actor-Critic for Multiplier Selection ---
         # Candidate multipliers (e.g., 0.8 => threshold = 0.65*0.8 = 0.52)
         self.strategy_candidates = [0.8, 0.85, 0.9, 0.95, 1.0]
         self.num_candidates = len(self.strategy_candidates)
         # Input features: [equity, pot_odds, opp_aggr, normalized_hand_count, normalized_total_reward]
         self.input_dim = 5  
         self.policy_net = PolicyNetwork(self.input_dim, self.num_candidates)
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.01)
-        # We'll store the log probability of the chosen action for the update.
+        self.value_net = ValueNetwork(self.input_dim)
+        self.actor_optimizer = optim.Adam(self.policy_net.parameters(), lr=0.01)
+        self.critic_optimizer = optim.Adam(self.value_net.parameters(), lr=0.01)
+        # We'll store the log probability and state features for the update.
         self.last_log_prob = None
+        self.last_state = None
 
         # --- Learning Start Threshold ---
         # Until this hand count is reached, play near GTO (fixed multiplier = 1.0).
@@ -133,52 +150,61 @@ class PlayerAgent(Agent):
         features = np.array([equity, pot_odds, opp_aggr, norm_hand, norm_reward], dtype=np.float32)
         return features
 
-    def select_strategy_pg(self, features):
+    def select_action_actor(self, features):
         """
-        Use the policy network with a softmax to select a raise threshold multiplier.
-        This implements a simple REINFORCE approach.
+        Use the policy network (actor) with softmax to select a raise threshold multiplier.
+        We'll store the log probability and state for later actor-critic update.
         """
         state = torch.tensor(features).unsqueeze(0)  # shape: [1, input_dim]
-        logits = self.policy_net(state)  # raw outputs
-        probs = torch.softmax(logits, dim=1)  # probabilities over candidates
+        logits = self.policy_net(state)  # raw logits
+        probs = torch.softmax(logits, dim=1)
         dist = torch.distributions.Categorical(probs)
         action = dist.sample()
         self.last_log_prob = dist.log_prob(action)
+        self.last_state = state
         chosen_multiplier = self.strategy_candidates[action.item()]
-        self.logger.debug(f"Selected multiplier: {chosen_multiplier} with log_prob {self.last_log_prob.item():.4f}")
+        self.logger.debug(f"Actor selected multiplier: {chosen_multiplier} (log_prob={self.last_log_prob.item():.4f})")
         return chosen_multiplier
 
-    def update_strategy_pg(self, reward):
+    def update_actor_critic(self, reward):
         """
-        Update the policy network using a REINFORCE update.
-        The loss is defined as -log_prob * reward.
+        Update both the actor (policy network) and the critic (value network) using an actor-critic update.
+        We'll compute the advantage as: reward - value_estimate.
         """
-        if self.last_log_prob is None:
+        if self.last_state is None or self.last_log_prob is None:
             return
-        # Negative reward (if reward is positive, we want to increase probability of that action)
-        loss = -self.last_log_prob * reward
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.logger.debug(f"Policy update: loss={loss.item():.4f}")
+        # Compute the value estimate for the last state.
+        value_estimate = self.value_net(self.last_state)
+        advantage = reward - value_estimate.item()
+        # Actor loss: negative log probability weighted by advantage.
+        actor_loss = -self.last_log_prob * advantage
+        # Critic loss: Mean Squared Error between reward and value estimate.
+        critic_loss = nn.MSELoss()(value_estimate, torch.tensor([[reward]], dtype=torch.float32))
+        total_loss = actor_loss + critic_loss
+        self.actor_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
+        total_loss.backward()
+        self.actor_optimizer.step()
+        self.critic_optimizer.step()
+        self.logger.debug(f"Actor-Critic update: actor_loss={actor_loss.item():.4f}, critic_loss={critic_loss.item():.4f}")
         self.last_log_prob = None
+        self.last_state = None
 
     def act(self, observation, reward, terminated, truncated, info):
-        # Update hand count on new hand termination.
-        # (We do not update hand_count here; it's updated in observe() on termination.)
+        # Auto-fold check at the start of a hand (reset_hand() is called at street 0).
         if observation["street"] == 0:
             self.reset_hand()
             remaining_rounds = TOTAL_MATCH_HANDS - self.hand_count
             needed_for_safe_fold = remaining_rounds * AVERAGE_FORCED_LOSS
-            self.logger.debug(f"Pre-hand: Hand count={self.hand_count}, net_advantage={self.total_reward:.2f}, threshold={needed_for_safe_fold:.2f}")
+            self.logger.debug(f"Pre-hand: hand_count={self.hand_count}, total_reward={self.total_reward:.2f}, threshold={needed_for_safe_fold:.2f}")
             if self.total_reward > 0 and self.total_reward >= needed_for_safe_fold:
-                self.logger.info(f"Auto-fold activated: net_advantage={self.total_reward:.2f} >= {needed_for_safe_fold:.2f}")
+                self.logger.info(f"Auto-fold activated: total_reward={self.total_reward:.2f} >= threshold={needed_for_safe_fold:.2f}")
                 return (action_types.FOLD.value, 0, -1)
 
         # Check auto-flop mode: if total_reward > 1.5 * rounds_left, play conservatively.
         rounds_left = TOTAL_MATCH_HANDS - self.hand_count
         if self.total_reward > AVERAGE_FORCED_LOSS * rounds_left:
-            self.logger.info(f"Auto-flop mode triggered. Hand count: {self.hand_count}, total_reward: {self.total_reward}, rounds_left: {rounds_left}")
+            self.logger.info(f"Auto-flop mode triggered. hand_count={self.hand_count}, total_reward={self.total_reward}, rounds_left={rounds_left}")
             valid = observation["valid_actions"]
             if observation["street"] == 0:
                 if valid[action_types.CALL.value]:
@@ -200,30 +226,34 @@ class PlayerAgent(Agent):
                 else:
                     self.logger.info("Auto-flop (post-flop): Folding.")
                     return (action_types.FOLD.value, 0, -1)
-        
-        # Normal behavior:
+
+        # Normal behavior: compute state features.
         equity = self.compute_equity(observation)
         continue_cost = observation["opp_bet"] - observation["my_bet"]
         pot_size = observation["opp_bet"] + observation["my_bet"]
         pot_odds = continue_cost / (pot_size + continue_cost) if continue_cost > 0 else 0.0
         opp_aggr = self.get_opponent_aggressiveness()
         features = self.get_features(observation, equity, pot_odds, opp_aggr)
-        # Use fixed GTO strategy until learning_start_hand, then switch to RL adaptation.
+        
+        # Use fixed GTO strategy until learning phase starts.
         if self.hand_count < self.learning_start_hand:
             chosen_multiplier = 1.0
             self.logger.debug("Using default GTO strategy (multiplier=1.0)")
         else:
-            chosen_multiplier = self.select_strategy_pg(features)
-            self.logger.debug(f"Using policy gradient strategy multiplier: {chosen_multiplier}")
+            chosen_multiplier = self.select_action_actor(features)
+            self.logger.debug(f"Using actor-critic strategy multiplier: {chosen_multiplier}")
+        
         normal_threshold = 0.65
         raise_threshold = normal_threshold * chosen_multiplier
         self.logger.debug(f"Computed raise threshold: {raise_threshold:.2f}")
+        
         self.update_opponent_model(observation)
-        self.logger.debug(f"Hand {self.hand_count}, Equity={equity:.2f}, PotOdds={pot_odds:.2f}, OppAgg={opp_aggr:.2f}")
+        self.logger.debug(f"hand_count={self.hand_count}, Equity={equity:.2f}, PotOdds={pot_odds:.2f}, OppAgg={opp_aggr:.2f}")
         valid = observation["valid_actions"]
         action_type = None
         raise_amount = 0
         card_to_discard = -1
+        
         if valid[action_types.RAISE.value] and equity > raise_threshold:
             action_type = action_types.RAISE.value
             factor = 0.75 if opp_aggr < 0.5 else 0.5
@@ -256,6 +286,6 @@ class PlayerAgent(Agent):
             self.hand_count += 1
             self.hand_counted = True
             self.logger.debug(f"Hand terminated. Updated hand count: {self.hand_count}")
-            # Update policy network even if we're in the GTO phase; this lets it collect data.
-            self.update_strategy_pg(reward)
+            # Update the actor-critic network.
+            self.update_actor_critic(reward)
             self.logger.info(f"Hand completed with reward={reward}")
