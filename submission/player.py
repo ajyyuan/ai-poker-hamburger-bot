@@ -122,6 +122,15 @@ class PlayerAgent(Agent):
         # --- Learning Start Threshold ---
         self.learning_start_hand = random.randint(175, 225)
         self.logger.info(f"RL adaptation will start at hand {self.learning_start_hand}")
+        
+        # --- Dynamic GTO Parameters (from optimization results) ---
+        self.equity_threshold_delta = 0.1
+        self.equity_adjustment_delta = 0.05
+        self.opp_aggr_lower_threshold = 0.4
+        self.opp_aggr_upper_threshold = 0.8
+        self.opp_aggr_adjustment_delta = 0.15
+        self.preflop_factor = 1.0
+        self.river_factor = 1.0
 
     def reset_hand(self):
         """Reset per-hand flags and hidden states at the start of each hand."""
@@ -231,29 +240,31 @@ class PlayerAgent(Agent):
 
     def dynamic_gto_multiplier(self, equity, pot_odds, opp_aggr, street):
         """
-        Compute a dynamic multiplier for the GTO phase based on the current state.
-        - If equity is significantly above pot odds, be more aggressive (lower multiplier).
-        - If equity is below pot odds, be more conservative (higher multiplier).
-        - Adjust based on opponent aggressiveness and street.
+        Compute a dynamic multiplier for the GTO phase using optimized parameters.
+        - If equity is significantly above pot odds, decrease multiplier by equity_adjustment_delta.
+        - If equity is significantly below pot odds, increase multiplier by equity_adjustment_delta.
+        - Adjust based on opponent aggression thresholds.
+        - Apply preflop and river factors based on the current street.
         """
         multiplier = 1.0
-        # Adjust for equity vs. pot odds.
-        if equity > pot_odds + 0.1:
-            multiplier -= 0.1
-        elif equity < pot_odds - 0.1:
-            multiplier += 0.1
+        
+        # Equity adjustment.
+        if equity > pot_odds + self.equity_threshold_delta:
+            multiplier -= self.equity_adjustment_delta
+        elif equity < pot_odds - self.equity_threshold_delta:
+            multiplier += self.equity_adjustment_delta
 
-        # Adjust for opponent aggression.
-        if opp_aggr > 0.6:
-            multiplier += 0.1
-        elif opp_aggr < 0.4:
-            multiplier -= 0.1
+        # Opponent aggression adjustment.
+        if opp_aggr > self.opp_aggr_upper_threshold:
+            multiplier += self.opp_aggr_adjustment_delta
+        elif opp_aggr < self.opp_aggr_lower_threshold:
+            multiplier -= self.opp_aggr_adjustment_delta
 
-        # Adjust for betting street (pre-flop more aggressive, river more conservative).
+        # Street adjustment.
         if street == 0:  # pre-flop
-            multiplier *= 0.95
+            multiplier *= self.preflop_factor
         elif street == 3:  # river
-            multiplier *= 1.05
+            multiplier *= self.river_factor
 
         # Bound multiplier within a reasonable range.
         multiplier = max(0.8, min(multiplier, 1.2))
@@ -264,7 +275,6 @@ class PlayerAgent(Agent):
         Use the meta-controller to select an expert, then use that expert's recurrent actor network
         to choose a raise threshold multiplier.
         """
-        # First, get meta-controller probabilities.
         state_meta = torch.tensor(features).unsqueeze(0)  # shape: [1, input_dim]
         meta_logits = self.meta_controller(state_meta)
         meta_probs = torch.softmax(meta_logits, dim=1)
@@ -273,10 +283,7 @@ class PlayerAgent(Agent):
         self.last_meta_log_prob = meta_dist.log_prob(torch.tensor(expert_index))
         self.last_expert_index = expert_index
 
-        # Now, use the chosen expert's actor.
-        # Prepare state for LSTM: shape [1, 1, input_dim]
-        state = torch.tensor(features).unsqueeze(0).unsqueeze(0)
-        # If this expert's hidden state is not initialized, do so.
+        state = torch.tensor(features).unsqueeze(0).unsqueeze(0)  # shape: [1, 1, input_dim]
         if self.expert_hidden[expert_index] is None:
             self.expert_hidden[expert_index] = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
         logits, new_hidden = self.expert_actors[expert_index](state, self.expert_hidden[expert_index])
@@ -298,13 +305,11 @@ class PlayerAgent(Agent):
         if self.last_state is None or self.last_expert_log_prob is None or self.last_meta_log_prob is None:
             return
         expert_index = self.last_expert_index
-        # Update critic for the chosen expert.
         if self.critic_hidden[expert_index] is None:
             self.critic_hidden[expert_index] = (torch.zeros(1, 1, 16), torch.zeros(1, 1, 16))
         value_estimate, new_hidden = self.expert_critics[expert_index](self.last_state, self.critic_hidden[expert_index])
         self.critic_hidden[expert_index] = new_hidden
         advantage = reward - value_estimate.item()
-        # Actor loss for the chosen expert.
         actor_loss = -self.last_expert_log_prob * advantage
         critic_loss = nn.MSELoss()(value_estimate, torch.tensor([[reward]], dtype=torch.float32))
         total_loss = actor_loss + critic_loss
@@ -313,7 +318,6 @@ class PlayerAgent(Agent):
         total_loss.backward()
         self.actor_optimizers[expert_index].step()
         self.critic_optimizers[expert_index].step()
-        # Also update meta-controller using the same advantage.
         meta_loss = -self.last_meta_log_prob * advantage
         self.meta_optimizer.zero_grad()
         meta_loss.backward()
@@ -326,20 +330,18 @@ class PlayerAgent(Agent):
     def maybe_switch_mode(self):
         """
         Occasionally switch mode (aggressive or conservative) for a brief period.
-        Aggressive forces multiplier=0.8; conservative forces multiplier=1.1.
         """
         if self.mode_duration > 0:
             self.mode_duration -= 1
         else:
-            if random.random() < 0.1:  # 10% chance to switch mode
+            if random.random() < 0.1:
                 self.mode = random.choice(["aggressive", "conservative"])
-                self.mode_duration = random.randint(3, 5)  # override lasts 3-5 hands
+                self.mode_duration = random.randint(3, 5)
                 self.logger.info(f"Mode switch: entering {self.mode} mode for {self.mode_duration} hands")
             else:
                 self.mode = "normal"
 
     def act(self, observation, reward, terminated, truncated, info):
-        # At street 0, reset hand and possibly switch mode.
         if observation["street"] == 0:
             self.reset_hand()
             self.maybe_switch_mode()
@@ -350,7 +352,6 @@ class PlayerAgent(Agent):
                 self.logger.info(f"Auto-fold activated: total_reward={self.total_reward:.2f} >= threshold={needed_for_safe_fold:.2f}")
                 return (action_types.FOLD.value, 0, -1)
 
-        # Check auto-flop mode.
         rounds_left = TOTAL_MATCH_HANDS - self.hand_count
         if self.total_reward > AVERAGE_FORCED_LOSS * rounds_left:
             self.logger.info(f"Auto-flop mode triggered. hand_count={self.hand_count}, total_reward={self.total_reward}, rounds_left={rounds_left}")
@@ -376,7 +377,6 @@ class PlayerAgent(Agent):
                     self.logger.info("Auto-flop (post-flop): Folding.")
                     return (action_types.FOLD.value, 0, -1)
 
-        # Normal behavior.
         equity = self.compute_equity(observation)
         continue_cost = observation["opp_bet"] - observation["my_bet"]
         pot_size = observation["opp_bet"] + observation["my_bet"]
@@ -384,7 +384,6 @@ class PlayerAgent(Agent):
         opp_aggr = self.get_opponent_aggressiveness()
         features = self.get_features(observation, equity, pot_odds, opp_aggr)
         
-        # Schedule-based strategy adjustment:
         if self.hand_count < 50:
             chosen_multiplier = self.aggressive_multiplier
             self.logger.info("Early phase: Using aggressive multiplier (first 50 hands)")
@@ -392,7 +391,6 @@ class PlayerAgent(Agent):
             chosen_multiplier = self.conservative_multiplier
             self.logger.info("Early phase: Using conservative multiplier (hands 50-100)")
         elif self.hand_count < self.learning_start_hand:
-            # Use dynamic, state-dependent GTO strategy.
             chosen_multiplier = self.dynamic_gto_multiplier(equity, pot_odds, opp_aggr, observation["street"])
             self.logger.info(f"GTO phase: Using dynamic GTO multiplier: {chosen_multiplier:.2f}")
         else:
@@ -434,7 +432,6 @@ class PlayerAgent(Agent):
         return (action_type, raise_amount, card_to_discard)
 
     def observe(self, observation, reward, terminated, truncated, info):
-        # Update total reward.
         self.total_reward += reward
         if terminated and not self.hand_counted:
             self.hand_count += 1
