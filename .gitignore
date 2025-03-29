@@ -1,1 +1,11 @@
-py_cache
+myvenv
+
+__pycache__/*
+agents/__pycache__/*
+submission/__pycache__/*
+
+agent_logs/*
+match_*.csv
+match.csv
+
+agent_config.json
