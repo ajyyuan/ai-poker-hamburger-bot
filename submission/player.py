@@ -15,7 +15,7 @@ int_to_card = PokerEnv.int_to_card
 TOTAL_MATCH_HANDS = 1000
 AVERAGE_FORCED_LOSS = 3  # Average stack difference lost per hand when auto-folding
 
-# Define a simple feedforward network as our policy network
+# Define a simple feedforward network as our policy network.
 class PolicyNetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(PolicyNetwork, self).__init__()
@@ -33,7 +33,7 @@ class PlayerAgent(Agent):
     def __init__(self, stream: bool = False):
         super().__init__(stream)
         self.evaluator = Evaluator()
-        # Track opponent's actions
+        # Track opponent's actions.
         self.opp_action_counts = {"raise": 0, "call": 0, "check": 0, "discard": 0, "fold": 0}
         self.last_opp_bet = 0
         self.has_discarded = False
@@ -41,12 +41,11 @@ class PlayerAgent(Agent):
         # Net advantage: (our chips - opponent's chips)
         self.total_reward = 0
 
-        # Hand counter and fingerprinting to detect new hands
+        # Hand counter and fingerprint for new hand detection.
         self.hand_count = 0
         self.last_hand_fingerprint = None
 
-        # --- RL Module: Contextual Bandit via Neural Network ---
-        # Candidate multipliers (e.g., 0.8 => threshold = 0.65*0.8 = 0.52)
+        # --- RL Module: Contextual Bandit using Neural Network ---
         self.strategy_candidates = [0.8, 0.85, 0.9, 0.95, 1.0]
         self.num_candidates = len(self.strategy_candidates)
         # Input features: [equity, pot_odds, opp_aggr, normalized_hand_count, normalized_total_reward]
@@ -54,14 +53,18 @@ class PlayerAgent(Agent):
         self.policy_net = PolicyNetwork(self.input_dim, self.num_candidates)
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.01)
         self.loss_fn = nn.MSELoss()
-        self.epsilon = 0.2  # Exploration rate
-        # Store the last features and chosen action index for training
+        self.epsilon = 0.2  # Exploration rate.
         self.last_features = None
         self.last_action_index = None
 
+        # --- Learning Start Threshold ---
+        # Until this hand count is reached, play near GTO (fixed multiplier).
+        self.learning_start_hand = random.randint(100, 200)
+        self.logger.info(f"RL adaptation will start at hand {self.learning_start_hand}")
+
     def update_hand_counter(self, observation):
         """
-        Update the hand counter using a simple fingerprint (your hole cards).
+        Update hand counter using a fingerprint of the hole cards.
         Called when street == 0.
         """
         if observation["street"] == 0:
@@ -78,7 +81,7 @@ class PlayerAgent(Agent):
 
     def compute_equity(self, observation, num_simulations=200):
         """
-        Monte Carlo simulation to estimate the probability (0..1) that our final hand beats the opponent's.
+        Monte Carlo simulation to estimate win probability.
         """
         my_cards = observation["my_cards"]
         community_cards = [c for c in observation["community_cards"] if c != -1]
@@ -88,7 +91,7 @@ class PlayerAgent(Agent):
         if observation["opp_drawn_card"] != -1:
             opp_known.append(observation["opp_drawn_card"])
         shown_cards = set(my_cards + community_cards + opp_known)
-        deck = list(range(27))  # 27-card deck (no clubs, no face cards)
+        deck = list(range(27))  # 27-card deck.
         non_shown_cards = [card for card in deck if card not in shown_cards]
 
         wins = 0
@@ -106,7 +109,7 @@ class PlayerAgent(Agent):
             board = [int_to_card(card) for card in board_sample]
             my_rank = self.evaluator.evaluate(my_hand, board)
             opp_rank = self.evaluator.evaluate(opp_hand, board)
-            if my_rank < opp_rank:  # lower rank is better
+            if my_rank < opp_rank:
                 wins += 1
         return wins / num_simulations if num_simulations > 0 else 0.0
 
@@ -136,11 +139,8 @@ class PlayerAgent(Agent):
     def get_features(self, observation, equity, pot_odds, opp_aggr):
         """
         Construct a feature vector:
-          - equity: estimated win probability
-          - pot_odds: ratio of call cost to total pot
-          - opp_aggr: opponent aggression ratio
-          - normalized hand count (hand_count / TOTAL_MATCH_HANDS)
-          - normalized total reward (total_reward / 100)
+          - equity, pot_odds, opp_aggr,
+          - normalized hand count, normalized total reward.
         """
         norm_hand = self.hand_count / TOTAL_MATCH_HANDS
         norm_reward = self.total_reward / 100.0
@@ -149,10 +149,10 @@ class PlayerAgent(Agent):
 
     def select_strategy_nn(self, features):
         """
-        Use the policy network with ε-greedy selection to choose a raise threshold multiplier.
+        Use the policy network with ε-greedy selection to choose a multiplier.
         """
-        state = torch.tensor(features).unsqueeze(0)  # shape: [1, input_dim]
-        q_values = self.policy_net(state)  # shape: [1, num_candidates]
+        state = torch.tensor(features).unsqueeze(0)  # Shape: [1, input_dim]
+        q_values = self.policy_net(state)
         q_values_np = q_values.detach().cpu().numpy().flatten()
         if random.random() < self.epsilon:
             action_index = random.randrange(self.num_candidates)
@@ -160,15 +160,14 @@ class PlayerAgent(Agent):
         else:
             action_index = int(np.argmax(q_values_np))
             self.logger.debug("Exploiting strategy (NN)")
-        self.last_features = state  # Store state for update
+        self.last_features = state
         self.last_action_index = action_index
         chosen_multiplier = self.strategy_candidates[action_index]
         return chosen_multiplier
 
     def update_strategy_nn(self, reward):
         """
-        After a hand, update the network by treating the observed reward as the target
-        for the Q-value of the chosen action.
+        Update the network using the observed reward as the target.
         """
         if self.last_features is None or self.last_action_index is None:
             return
@@ -179,14 +178,13 @@ class PlayerAgent(Agent):
         loss = self.loss_fn(q_value, target)
         loss.backward()
         self.optimizer.step()
-        # Decay exploration slightly.
         self.epsilon = max(0.05, self.epsilon * 0.99)
-        self.logger.debug(f"Updated NN strategy: loss={loss.item():.4f}, new epsilon={self.epsilon:.4f}")
+        self.logger.debug(f"NN update: loss={loss.item():.4f}, new epsilon={self.epsilon:.4f}")
         self.last_features = None
         self.last_action_index = None
 
     def act(self, observation, reward, terminated, truncated, info):
-        # Update hand counter
+        # Update hand counter.
         self.update_hand_counter(observation)
         if observation["street"] == 0:
             self.reset_hand()
@@ -200,19 +198,27 @@ class PlayerAgent(Agent):
                     f"Folding rest of match. net_advantage={self.total_reward:.2f}, needed={needed_for_safe_fold:.2f}"
                 )
                 return (action_types.FOLD.value, 0, -1)
-        # Compute contextual features
+
+        # Compute context features.
         equity = self.compute_equity(observation)
         continue_cost = observation["opp_bet"] - observation["my_bet"]
         pot_size = observation["opp_bet"] + observation["my_bet"]
         pot_odds = continue_cost / (pot_size + continue_cost) if continue_cost > 0 else 0.0
         opp_aggr = self.get_opponent_aggressiveness()
         features = self.get_features(observation, equity, pot_odds, opp_aggr)
-        # Select raise threshold multiplier using the NN-based strategy
-        chosen_multiplier = self.select_strategy_nn(features)
+
+        # If we haven't reached the RL adaptation phase, use fixed (GTO) strategy.
+        if self.hand_count < self.learning_start_hand:
+            chosen_multiplier = 1.0
+            self.logger.debug(f"Using default GTO strategy (multiplier={chosen_multiplier})")
+        else:
+            chosen_multiplier = self.select_strategy_nn(features)
+            self.logger.debug(f"Using NN strategy multiplier: {chosen_multiplier}")
+
         normal_threshold = 0.65
         raise_threshold = normal_threshold * chosen_multiplier
-        self.logger.debug(f"Using NN strategy multiplier: {chosen_multiplier} (raise_threshold={raise_threshold:.2f})")
-        # Update opponent model and log state
+        self.logger.debug(f"Raise threshold: {raise_threshold:.2f} (normal_threshold={normal_threshold})")
+
         self.update_opponent_model(observation)
         self.logger.debug(
             f"Hand {self.hand_count}, Equity={equity:.2f}, PotOdds={pot_odds:.2f}, OppAgg={opp_aggr:.2f}"
@@ -221,7 +227,8 @@ class PlayerAgent(Agent):
         action_type = None
         raise_amount = 0
         card_to_discard = -1
-        # Decision tree for action selection:
+
+        # Action selection decision tree.
         if valid[action_types.RAISE.value] and equity > raise_threshold:
             action_type = action_types.RAISE.value
             factor = 0.75 if opp_aggr < 0.5 else 0.5
@@ -246,13 +253,13 @@ class PlayerAgent(Agent):
         else:
             action_type = action_types.FOLD.value
             self.logger.info(f"Folding with equity={equity:.2f}, pot_odds={pot_odds:.2f}")
+
         return (action_type, raise_amount, card_to_discard)
 
     def observe(self, observation, reward, terminated, truncated, info):
         self.update_hand_counter(observation)
         self.total_reward += reward
         if terminated:
-            # Update the NN-based strategy using the hand reward.
+            # Update NN strategy regardless of phase so it accumulates data.
             self.update_strategy_nn(reward)
-            if abs(reward) > 20:
-                self.logger.info(f"Hand completed with reward={reward}")
+            self.logger.info(f"Hand completed with reward={reward}")
