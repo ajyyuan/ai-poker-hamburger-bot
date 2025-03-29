@@ -229,6 +229,36 @@ class PlayerAgent(Agent):
         ], dtype=np.float32)
         return features
 
+    def dynamic_gto_multiplier(self, equity, pot_odds, opp_aggr, street):
+        """
+        Compute a dynamic multiplier for the GTO phase based on the current state.
+        - If equity is significantly above pot odds, be more aggressive (lower multiplier).
+        - If equity is below pot odds, be more conservative (higher multiplier).
+        - Adjust based on opponent aggressiveness and street.
+        """
+        multiplier = 1.0
+        # Adjust for equity vs. pot odds.
+        if equity > pot_odds + 0.1:
+            multiplier -= 0.1
+        elif equity < pot_odds - 0.1:
+            multiplier += 0.1
+
+        # Adjust for opponent aggression.
+        if opp_aggr > 0.6:
+            multiplier += 0.1
+        elif opp_aggr < 0.4:
+            multiplier -= 0.1
+
+        # Adjust for betting street (pre-flop more aggressive, river more conservative).
+        if street == 0:  # pre-flop
+            multiplier *= 0.95
+        elif street == 3:  # river
+            multiplier *= 1.05
+
+        # Bound multiplier within a reasonable range.
+        multiplier = max(0.8, min(multiplier, 1.2))
+        return multiplier
+
     def select_action_actor(self, features):
         """
         Use the meta-controller to select an expert, then use that expert's recurrent actor network
@@ -362,8 +392,9 @@ class PlayerAgent(Agent):
             chosen_multiplier = self.conservative_multiplier
             self.logger.info("Early phase: Using conservative multiplier (hands 50-100)")
         elif self.hand_count < self.learning_start_hand:
-            chosen_multiplier = 1.0  # GTO strategy
-            self.logger.info("GTO phase: Using fixed multiplier (1.0) until learning starts")
+            # Use dynamic, state-dependent GTO strategy.
+            chosen_multiplier = self.dynamic_gto_multiplier(equity, pot_odds, opp_aggr, observation["street"])
+            self.logger.info(f"GTO phase: Using dynamic GTO multiplier: {chosen_multiplier:.2f}")
         else:
             chosen_multiplier = self.select_action_actor(features)
             self.logger.debug(f"Using actor-critic ensemble; chosen multiplier: {chosen_multiplier}")
