@@ -13,7 +13,7 @@ int_to_card = PokerEnv.int_to_card
 
 # Constants
 TOTAL_MATCH_HANDS = 1000
-AVERAGE_FORCED_LOSS = 3  # Avg stack difference lost per hand when auto-folding
+AVERAGE_FORCED_LOSS = 1.5  # Avg stack difference lost per hand when auto-folding
 
 # Define a simple feedforward network as our policy network.
 class PolicyNetwork(nn.Module):
@@ -184,7 +184,7 @@ class PlayerAgent(Agent):
         
         # Check auto-flop mode: if total_reward > 3 * rounds_left, play conservatively.
         rounds_left = TOTAL_MATCH_HANDS - self.hand_count
-        if self.total_reward > 3 * rounds_left:
+        if self.total_reward > AVERAGE_FORCED_LOSS * rounds_left + 1:
             self.logger.info(f"Auto-flop mode triggered. Hand count: {self.hand_count}, total_reward: {self.total_reward}, rounds_left: {rounds_left}")
             valid = observation["valid_actions"]
             if observation["street"] == 0:
